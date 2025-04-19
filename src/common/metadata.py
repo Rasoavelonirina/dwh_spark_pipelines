@@ -5,7 +5,8 @@ import os
 import logging
 from datetime import date, datetime, timedelta
 from abc import ABC, abstractmethod
-
+from pyspark.sql import SparkSession 
+from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
 logger = logging.getLogger(__name__)
 
 # --- Constantes ---
@@ -154,10 +155,10 @@ def get_metadata_tracker(config):
     tracker_type = None
     if metadata_config.get("tracker_file_path"):
         tracker_type = "json_file"
-    elif metadata_config.get("tracker_db_table"):
+    elif metadata_config.get("tracker_db_table") and metadata_config.get("metadata_db_connection_name"):
         tracker_type = "database" # Placeholder for future DB implementation
     else:
-        raise ValueError("Metadata config must specify 'tracker_file_path' (for JSON) or 'tracker_db_table' (for DB - not implemented).")
+        raise ValueError("Metadata config must specify either ('tracker_db_table' and 'metadata_db_connection_name') OR 'tracker_file_path'.")
 
     logger.info(f"Metadata tracker type determined as: {tracker_type}")
 
@@ -168,23 +169,204 @@ def get_metadata_tracker(config):
         return JsonFileMetadataTracker(file_path)
 
     elif tracker_type == "database":
-        # --- Placeholder for Database Implementation ---
-        logger.error("Database metadata tracker is not yet implemented.")
-        raise NotImplementedError("Database metadata tracker is not implemented.")
-        # db_connection_name = metadata_config.get("metadata_db_connection_name")
-        # table_name = metadata_config.get("tracker_db_table")
-        # if not db_connection_name or not table_name:
-        #     raise ValueError("Database tracker requires 'metadata_db_connection_name' and 'tracker_db_table' in metadata config.")
-        # # Need to get DB connection details from the main config using db_connection_name
-        # db_config = config.get('db_connections', {}).get(db_connection_name)
-        # if not db_config:
-        #     raise ValueError(f"Database connection details not found for '{db_connection_name}' in 'db_connections' config.")
-        # return DatabaseMetadataTracker(db_config, table_name) # Pass necessary details
-        # --- End Placeholder ---
+        spark = SparkSession.getActiveSession()
+        if not spark:
+             # Ceci ne devrait pas arriver si appelé depuis un job Spark actif
+             raise RuntimeError("No active SparkSession found. DatabaseMetadataTracker requires an active session.")
+
+        db_connection_name = metadata_config.get("metadata_db_connection_name")
+        table_name = metadata_config.get("tracker_db_table")
+        if not db_connection_name or not table_name: # Validation redondante mais sûre
+            raise ValueError("Database tracker requires 'metadata_db_connection_name' and 'tracker_db_table' in metadata config.")
+
+        # Extraire les propriétés de la connexion BDD depuis la config principale
+        db_connections = config.get('db_connections')
+        if not db_connections or db_connection_name not in db_connections:
+            raise ValueError(f"Database connection details for '{db_connection_name}' not found in common 'db_connections' config.")
+        conn_details = db_connections[db_connection_name]
+
+        # Préparer les propriétés pour JDBC (similaire à la fonction dans loader.py)
+        # On pourrait factoriser _get_db_connection_properties si on veut
+        jdbc_url = conn_details.get('uri')
+        base_name = conn_details.get('base')
+        db_type = conn_details.get('db_type', 'mariadb')
+        if not jdbc_url.startswith("jdbc:"):
+             if base_name:
+                 jdbc_url = f"jdbc:{db_type}://{jdbc_url}/{base_name}"
+             else:
+                 raise ValueError(f"Database name ('base') required for DB metadata connection '{db_connection_name}'.")
+
+        db_properties = {
+            "url": jdbc_url, # Stocker l'URL complet ici pour la classe
+            "user": conn_details.get('user'),
+            "password": conn_details.get('pwd'), # Rappel: Sécurité!
+            "driver": conn_details.get('driver', "org.mariadb.jdbc.Driver")
+        }
+        custom_props = conn_details.get('properties')
+        if custom_props and isinstance(custom_props, dict):
+            db_properties.update(custom_props)
+        if not db_properties["user"] or db_properties["password"] is None or not db_properties["driver"]:
+             raise ValueError(f"Missing user, pwd, or driver for metadata DB connection '{db_connection_name}'.")
+
+        return DatabaseMetadataTracker(spark, db_properties, table_name)
 
     else:
         # Should not be reachable if logic above is correct
         raise ValueError(f"Unsupported metadata tracker type: {tracker_type}")
+
+# --- NOUVELLE Implémentation Base de Données ---
+class DatabaseMetadataTracker(BaseMetadataTracker):
+    """Tracks metadata using a database table via Spark JDBC."""
+
+    # Colonnes attendues dans la table BDD
+    JOB_ID_COL = "job_identifier"
+    DATE_COL = "last_successfully_processed_date"
+    TIMESTAMP_COL = "last_update_timestamp"
+
+    def __init__(self, spark: SparkSession, db_properties: dict, table_name: str):
+        """
+        Initializes the tracker.
+
+        Args:
+            spark (SparkSession): The active SparkSession.
+            db_properties (dict): Dictionary from _get_db_connection_properties
+                                  containing 'url', 'user', 'password', 'driver', etc.
+            table_name (str): The fully qualified name of the metadata table (e.g., 'metadata_db.job_tracker').
+        """
+        if not spark:
+            raise ValueError("SparkSession is required for DatabaseMetadataTracker.")
+        if not db_properties or not db_properties.get('url'):
+            raise ValueError("Database connection properties (including url) are required.")
+        if not table_name:
+            raise ValueError("Database table name is required.")
+
+        self.spark = spark
+        self.db_properties = db_properties # Contient url, user, password, driver...
+        self.table_name = table_name
+        # Note: url doit être complet ici (incluant la base si nécessaire par le driver)
+        self.jdbc_url = db_properties['url']
+
+        logger.info(f"Initializing DatabaseMetadataTracker for table: {self.table_name} at {self.jdbc_url}")
+        # Pourrait inclure une vérification de l'existence de la table/colonnes ici si souhaité
+
+    def read_last_processed_date(self, job_identifier: str) -> date | None:
+        """Reads the last successfully processed date for the given job identifier from the DB."""
+        if not job_identifier:
+            raise ValueError("job_identifier cannot be empty.")
+
+        logger.info(f"Reading last processed date for job '{job_identifier}' from table {self.table_name}")
+        try:
+            # Lire seulement la ligne pour ce job_identifier
+            query = f"""
+                (SELECT {self.DATE_COL}
+                 FROM {self.table_name}
+                 WHERE {self.JOB_ID_COL} = '{job_identifier}'
+                ) AS read_query
+            """
+            logger.debug(f"Executing read query: {query.strip()}")
+
+            df = self.spark.read.jdbc(
+                url=self.jdbc_url,
+                table=query,
+                properties=self.db_properties
+            )
+
+            # Récupérer le résultat (devrait être 0 ou 1 ligne)
+            result = df.first() # Collecte seulement la première ligne si elle existe
+
+            if result is None:
+                logger.info(f"No metadata record found for job '{job_identifier}'.")
+                return None
+            else:
+                last_date = getattr(result, self.DATE_COL, None) # Accès sécurisé à la colonne
+                if isinstance(last_date, date):
+                    logger.info(f"Found last processed date for job '{job_identifier}': {last_date.isoformat()}")
+                    return last_date
+                else:
+                    # Gérer le cas où la date est NULL dans la BDD
+                    logger.warning(f"Metadata record found for job '{job_identifier}', but date column is NULL or not a date.")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Failed to read metadata for job '{job_identifier}' from {self.table_name}: {e}", exc_info=True)
+            # Important: Ne pas retourner None aveuglément, car une erreur DB peut masquer un état réel.
+            # Relever l'erreur permet à l'appelant (date_utils) de décider de la stratégie.
+            # Cependant, pour simplifier l'intégration avec date_utils actuel qui attend None en cas d'échec,
+            # nous allons logger et retourner None, mais c'est un point à reconsidérer pour la robustesse.
+            logger.warning(f"Returning None for last processed date due to read error for job '{job_identifier}'.")
+            return None # Compromis pour l'intégration actuelle
+
+    def write_last_processed_date(self, job_identifier: str, process_date: date):
+        """
+        Writes/Updates the successfully processed date for the given job identifier in the DB.
+        Uses a read-modify-write approach with Spark DataFrames (less efficient for single row).
+        Assumes table exists.
+        """
+        if not job_identifier:
+            raise ValueError("job_identifier cannot be empty.")
+        if not isinstance(process_date, date):
+            raise ValueError("process_date must be a valid datetime.date object.")
+
+        logger.info(f"Updating last processed date for job '{job_identifier}' to {process_date.isoformat()} in table {self.table_name}")
+
+        try:
+            # 1. Lire toutes les métadonnées existantes (sauf pour le job courant)
+            # Attention: Peut être coûteux si la table de métadonnées est grande!
+            logger.debug(f"Reading existing metadata (excluding current job '{job_identifier}')...")
+            filter_cond = f"{self.JOB_ID_COL} != '{job_identifier}'"
+            try:
+                 # Lire toutes les colonnes nécessaires pour réécrire
+                 other_jobs_df = self.spark.read.jdbc(
+                    url=self.jdbc_url,
+                    table=self.table_name,
+                    properties=self.db_properties
+                 ).where(filter_cond).select(self.JOB_ID_COL, self.DATE_COL, self.TIMESTAMP_COL)
+                 other_jobs_count = other_jobs_df.count()
+                 logger.debug(f"Read {other_jobs_count} records for other jobs.")
+            except Exception as read_err:
+                 # Si la table n'existe pas encore, on ne peut pas lire. On continue en supposant
+                 # que l'écriture créera la table ou la première ligne.
+                 # Analyser l'erreur spécifique est nécessaire pour plus de robustesse.
+                 logger.warning(f"Could not read existing metadata (table might not exist?): {read_err}. Proceeding with insert/overwrite.")
+                 other_jobs_df = None # Marquer comme non lu
+
+
+            # 2. Créer un DataFrame pour la nouvelle ligne/mise à jour
+            current_time = datetime.now()
+            new_row_data = [(job_identifier, process_date, current_time)]
+            schema = StructType([
+                StructField(self.JOB_ID_COL, StringType(), False),
+                StructField(self.DATE_COL, DateType(), True),
+                StructField(self.TIMESTAMP_COL, TimestampType(), True) # Assurez-vous que ce type correspond à la BDD
+            ])
+            new_row_df = self.spark.createDataFrame(new_row_data, schema)
+            logger.debug("Created DataFrame for the new/updated metadata row.")
+
+            # 3. Combiner l'ancien (filtré) et le nouveau
+            if other_jobs_df is not None and not other_jobs_df.rdd.isEmpty():
+                 # S'assurer que les schémas correspondent avant l'union (surtout les types)
+                 # Spark >= 3.0 `unionByName` est plus sûr si les schémas sont complexes ou l'ordre diffère
+                 final_df_to_write = other_jobs_df.unionByName(new_row_df) # Utiliser unionByName par sécurité
+                 logger.debug("Combined existing metadata (filtered) with the new row.")
+            else:
+                 # Si pas d'autres données ou lecture échouée, écrire seulement la nouvelle ligne
+                 final_df_to_write = new_row_df
+                 logger.debug("No existing metadata found or read failed, preparing to write only the new row.")
+
+            # 4. Écrire le DataFrame combiné en mode overwrite
+            # Ceci remplace TOUT le contenu de la table par le contenu de final_df_to_write
+            logger.info(f"Writing combined metadata back to {self.table_name} using mode 'overwrite'.")
+            final_df_to_write.write.jdbc(
+                url=self.jdbc_url,
+                table=self.table_name,
+                mode="overwrite", # ATTENTION: Efface la table et réécrit !
+                properties=self.db_properties
+            )
+            logger.info(f"Successfully wrote metadata update for job '{job_identifier}'.")
+
+        except Exception as e:
+            logger.error(f"Failed to write metadata for job '{job_identifier}' to {self.table_name}: {e}", exc_info=True)
+            raise # Relever l'erreur pour indiquer l'échec de l'écriture
 
 
 # --- Fonctions Publiques Simplifiées ---
