@@ -28,44 +28,82 @@ def get_mongo_connection_options(config: dict, connection_name: str) -> dict:
     Raises:
         ValueError: If required configuration keys are missing.
     """
-    if not connection_name:
-        raise ValueError("MongoDB connection name cannot be empty.")
-
+    # ... (Get db_connections and conn_details as before) ...
     db_connections = config.get('db_connections')
     if not db_connections or connection_name not in db_connections:
-        raise ValueError(f"MongoDB connection details for '{connection_name}' not found in common 'db_connections' config.")
-
+        raise ValueError(f"Connection details for '{connection_name}' not found.")
     conn_details = db_connections[connection_name]
 
-    if conn_details.get('db_type') != 'mongodb':
-         logger.warning(f"Connection '{connection_name}' is not of db_type 'mongodb'.")
-         # Or raise ValueError depending on strictness
+    # --- Extraire les composants ---
+    db_type = conn_details.get('db_type')
+    if db_type != 'mongodb': raise ValueError(f"Connection '{connection_name}' is not db_type 'mongodb'.")
 
-    mongo_uri = conn_details.get('uri')
-    database_name = conn_details.get('base')
+    host_str = conn_details.get('host')
+    port_str = conn_details.get('port', '27017') # Port par défaut Mongo
+    base = conn_details.get('base')
+    user = conn_details.get('user') # Optionnel
+    password = conn_details.get('pwd') # Optionnel (mais requis si user fourni)
+    auth_source = conn_details.get('auth_source') # Optionnel
+    replica_set = conn_details.get('replica_set') # Optionnel
+    mongo_options_str = conn_details.get('mongo_options', '') # Optionnel
 
-    if not mongo_uri:
-        raise ValueError(f"Missing 'uri' (MongoDB connection string) for connection '{connection_name}'.")
-    if not database_name:
-        raise ValueError(f"Missing 'base' (MongoDB database name) for connection '{connection_name}'.")
+    # --- Validation ---
+    if not host_str: raise ValueError(f"Missing 'host' for MongoDB connection '{connection_name}'.")
+    if not base: raise ValueError(f"Missing 'base' (database name) for MongoDB connection '{connection_name}'.")
+    if user and password is None: logger.warning(f"User '{user}' provided for MongoDB connection '{connection_name}' but 'pwd' is missing.")
 
-    # Start with essential options
-    options = {
-        "uri": mongo_uri,
-        "database": database_name
+    # --- Construire l'URI MongoDB ---
+    # Format: mongodb://[username:password@]host1[:port1][,host2[:port2],...][/database][?options]
+
+    uri = "mongodb://"
+
+    # Ajouter User/Password si fournis
+    if user and password is not None:
+        from urllib.parse import quote_plus # Pour encoder user/pwd si caractères spéciaux
+        uri += f"{quote_plus(user)}:{quote_plus(password)}@"
+
+    # Ajouter Hôte(s) et Port(s)
+    hosts = host_str.split(',')
+    host_port_parts = []
+    for h in hosts:
+        h = h.strip()
+        if ':' in h: # Si port est inclus dans la chaîne host
+            host_port_parts.append(h)
+        else: # Utiliser le port par défaut/spécifié
+            host_port_parts.append(f"{h}:{port_str}")
+    uri += ",".join(host_port_parts)
+
+    # Ajouter Base (techniquement optionnel dans URI si spécifié via option, mais incluons-le)
+    uri += f"/{base}"
+
+    # Ajouter Options
+    options_list = []
+    if replica_set: options_list.append(f"replicaSet={replica_set}")
+    if auth_source: options_list.append(f"authSource={auth_source}")
+    # Ajouter les options de la chaîne mongo_options_str
+    if mongo_options_str:
+        # Nettoyer la chaîne (enlever '?' du début si présent)
+        clean_options = mongo_options_str.strip()
+        if clean_options.startswith('?'):
+            clean_options = clean_options[1:]
+        if clean_options: # Ne pas ajouter si vide après nettoyage
+             options_list.append(clean_options)
+
+    if options_list:
+        uri += "?" + "&".join(options_list)
+
+    logger.debug(f"Constructed MongoDB URI for '{connection_name}': {uri}")
+
+    # --- Préparer le dictionnaire d'options pour Spark ---
+    # Le connecteur a principalement besoin de l'URI maintenant
+    options_for_spark = {
+        "uri": uri,
+        "database": base # Redondant si dans URI, mais peut être utile
+        # Ajouter d'autres options de base si nécessaire ici, ex:
+        # "readPreference.name": conn_details.get('readPreference'), # Exemple
     }
 
-    # Add other potential options from config (e.g., readPreference, readConcern)
-    # These need to match the Spark MongoDB connector option names
-    # Example: Mapping 'readPreference' from config if present
-    if 'readPreference' in conn_details:
-         options['readPreference.name'] = conn_details['readPreference']
-    if 'readConcern' in conn_details:
-         options['readConcern.level'] = conn_details['readConcern']
-    # Add more options as needed...
-
-    logger.debug(f"Prepared MongoDB options for connection '{connection_name}': {options}")
-    return options
+    return options_for_spark
 
 
 # --- Classe Handler MongoDB ---
