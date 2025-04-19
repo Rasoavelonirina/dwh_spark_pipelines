@@ -5,71 +5,15 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, upper # Import col and upper functions
 from datetime import date
 
+try:
+    from common.data_clients import get_data_handler 
+    from common.jdbc_utils import JdbcHandler # Importer pour vérification de type si nécessaire
+except ImportError:
+     print("Error: Could not import get_data_handler or JdbcHandler.")
+     get_data_handler = None
+     JdbcHandler = None # Définir comme None si l'import échoue
+
 logger = logging.getLogger(__name__)
-
-def _get_db_connection_properties(config):
-    """
-    Extracts database connection details from the configuration.
-
-    Args:
-        config (dict): The application configuration dictionary.
-
-    Returns:
-        tuple: (jdbc_url, connection_properties) where connection_properties is a dict
-               containing user, password, driver, and potentially other options.
-
-    Raises:
-        ValueError: If required configuration keys are missing.
-    """
-    connection_name = config.get('database_connection_name')
-    if not connection_name:
-        raise ValueError("Job config is missing 'database_connection_name'.")
-
-    db_connections = config.get('db_connections')
-    if not db_connections or connection_name not in db_connections:
-        raise ValueError(f"Database connection details for '{connection_name}' not found in common 'db_connections' config.")
-
-    conn_details = db_connections[connection_name]
-
-    jdbc_url = conn_details.get('uri')
-    # Add port if not already in uri? Typically URI includes host:port
-    # Standard MariaDB/MySQL port is 3306. Let's assume it's in the URI or default.
-    base_name = conn_details.get('base')
-    db_type = conn_details.get('db_type', 'mariadb') # Default to mariadb if not specified
-
-    # Construct JDBC URL carefully
-    # Example assumes URI is hostname only or hostname:port
-    if not jdbc_url.startswith("jdbc:"):
-         if base_name:
-              # Example for mariadb/mysql
-              jdbc_url = f"jdbc:{db_type}://{jdbc_url}/{base_name}"
-              logger.debug(f"Constructed JDBC URL: {jdbc_url}")
-         else:
-              raise ValueError(f"Database name ('base') is required in config for connection '{connection_name}' if not included in URI.")
-    else:
-        # Assume provided URI is a full JDBC URL
-        logger.debug(f"Using provided JDBC URL: {jdbc_url}")
-
-
-    # Prepare connection properties
-    properties = {
-        "user": conn_details.get('user'),
-        "password": conn_details.get('pwd'), # SECURITY WARNING: Password in config!
-        "driver": conn_details.get('driver', "org.mariadb.jdbc.Driver") # Default driver
-    }
-    # Add custom JDBC properties from config if they exist
-    custom_props = conn_details.get('properties')
-    if custom_props and isinstance(custom_props, dict):
-        properties.update(custom_props)
-        logger.debug(f"Added custom JDBC properties: {custom_props}")
-
-    # Validate essential properties
-    if not properties["user"] or properties["password"] is None: # Check explicitly for None if empty password allowed?
-        raise ValueError(f"Missing 'user' or 'pwd' for database connection '{connection_name}'.")
-    if not properties["driver"]:
-         raise ValueError(f"Missing 'driver' for database connection '{connection_name}'.")
-
-    return jdbc_url, properties
 
 
 def load_active_users(spark: SparkSession, config: dict) -> DataFrame:
@@ -88,7 +32,24 @@ def load_active_users(spark: SparkSession, config: dict) -> DataFrame:
         py4j.protocol.Py4JJavaError: If there's an error connecting to or reading from the database.
     """
     logger.info("Loading active users...")
+    if not get_data_handler:
+         raise ImportError("Data Handler client factory not available.")
 
+    connection_name = config.get('database_connection_name')
+    if not connection_name:
+        raise ValueError("Job config missing 'database_connection_name'.")
+
+    # Get the handler instance using the new factory name
+    data_handler = get_data_handler(spark, config, connection_name)
+    if not data_handler:
+        raise RuntimeError(f"Failed to initialize Data Handler for connection '{connection_name}'.")
+
+    # --- Vérifier que c'est bien un handler JDBC pour read_query ---
+    # Cette vérification est nécessaire car read_query est spécifique à JdbcHandler
+    if not isinstance(data_handler, JdbcHandler):
+         raise TypeError(f"Expected a JdbcHandler for connection '{connection_name}' to use read_query, but got {type(data_handler).__name__}.")
+
+    # --- Get config details (inchangé) ---
     users_table_name = config.get("tables", {}).get("users")
     msisdn_col_name = config.get("columns", {}).get("users", {}).get("msisdn", "user_msisdn") # Default added
     status_col_name = config.get("columns", {}).get("users", {}).get("status", "user_status") # Default added
@@ -103,28 +64,23 @@ def load_active_users(spark: SparkSession, config: dict) -> DataFrame:
     logger.info(f"Filtering by status column: {status_col_name} = '{active_status_value}'")
     logger.info(f"Selecting MSISDN column: {msisdn_col_name}")
 
-    jdbc_url, connection_properties = _get_db_connection_properties(config)
-
     try:
         # Construct the query to filter directly in the database for efficiency
         # Using 'upper' on both sides for case-insensitive comparison if needed
         # Adjust if your database collation handles case sensitivity correctly
         # Using f-string is generally okay here as table/column names come from trusted config
-        query = f"""
-            (SELECT {msisdn_col_name} AS msisdn
-             FROM {users_table_name}
-             WHERE upper({status_col_name}) = upper('{active_status_value}')
-            ) AS active_users_query
-        """
+        # --- Construct and run query
+        query_string = f"""
+                SELECT {msisdn_col_name} AS msisdn
+                FROM {users_table_name}
+                WHERE upper({status_col_name}) = upper('{active_status_value}')
+            """
+        query_alias = "active_users_query"
         # The outer alias `active_users_query` is required by Spark JDBC source
 
-        logger.debug(f"Executing JDBC read with query: {query.strip()}")
-
-        active_users_df = spark.read.jdbc(
-            url=jdbc_url,
-            table=query, # Pass the query as the "table"
-            properties=connection_properties
-        )
+        logger.debug(f"Executing JDBC read with query: {query_string.strip()}")
+        # Utiliser la méthode read_query spécifique du JdbcHandler
+        active_users_df = data_handler.read_query(query_alias=query_alias, query_string=query_string)
 
         # Ensure the column name is 'msisdn' for consistency downstream
         active_users_df = active_users_df.select(col("msisdn").alias("msisdn"))
@@ -162,6 +118,22 @@ def load_transactions(spark: SparkSession, config: dict, start_date: date, end_d
     """
     logger.info(f"Loading transactions from {start_date.isoformat()} to {end_date.isoformat()}...")
 
+    if not get_data_handler:
+         raise ImportError("Data Handler client factory not available.")
+
+    connection_name = config.get('database_connection_name')
+    if not connection_name:
+        raise ValueError("Job config missing 'database_connection_name'.")
+
+    data_handler = get_data_handler(spark, config, connection_name)
+    if not data_handler:
+        raise RuntimeError(f"Failed to initialize Data Handler for connection '{connection_name}'.")
+
+    # --- Vérifier que c'est bien un handler JDBC ---
+    if not isinstance(data_handler, JdbcHandler):
+         raise TypeError(f"Expected a JdbcHandler for connection '{connection_name}' to use read_query, but got {type(data_handler).__name__}.")
+
+    # --- Get config details (inchangé) ---
     tx_table_name = config.get("tables", {}).get("transactions")
     date_col_name = config.get("columns", {}).get("transactions", {}).get("date", "tra_date") # Default added
     # Get all needed transaction columns from config
@@ -189,8 +161,6 @@ def load_transactions(spark: SparkSession, config: dict, start_date: date, end_d
     logger.info(f"Filtering by date column: {date_col_name} between '{start_date.isoformat()}' and '{end_date.isoformat()}'")
     logger.info(f"Selecting columns: {select_expr}")
 
-    jdbc_url, connection_properties = _get_db_connection_properties(config)
-
     # Option 1: Filter using `where` clause (simpler, relies on DB optimization)
     # date_filter_str = f"{date_col_name} >= '{start_date.isoformat()}' AND {date_col_name} <= '{end_date.isoformat()}'"
 
@@ -211,25 +181,20 @@ def load_transactions(spark: SparkSession, config: dict, start_date: date, end_d
 
     # Construct the query using selected columns
     # Ensure backticks or quotes around column names if they contain special chars or are keywords
-    query = f"""
+    query_string = f"""
         (SELECT {select_expr}
          FROM {tx_table_name}
          WHERE {predicates[0]} AND {predicates[1]}
-        ) AS transactions_query
+        )
     """
+    query_alias = "transactions_query" # Alias for the subquery
     # The WHERE clause here is primarily for documentation/readability;
     # the actual pushdown might happen via predicates if option 2 is used fully.
     # Using WHERE directly is often reliable. Let's stick to explicit WHERE for now.
 
-    logger.debug(f"Executing JDBC read with query: {query.strip()}")
+    logger.debug(f"Executing JDBC read with query: {query_string.strip()}")
     try:
-        transactions_df = spark.read.jdbc(
-            url=jdbc_url,
-            table=query, # Pass the query with WHERE clause
-            # predicates=predicates, # Use if opting for predicate pushdown *instead* of WHERE in query
-            properties=connection_properties
-        )
-
+        transactions_df = data_handler.read_query(query_alias=query_alias, query_string=query_string)
         count = transactions_df.count() # Action to trigger read and check connection
         logger.info(f"Successfully loaded {count} transactions for the period.")
 
