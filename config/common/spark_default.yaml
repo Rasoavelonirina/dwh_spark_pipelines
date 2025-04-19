@@ -1,0 +1,29 @@
+# config/common/spark_defaults.yaml
+# Default Spark configurations for applications in this project
+
+# Application Defaults
+default_app_name: "DataPipelineApp"
+
+# Resource Allocation Defaults (Examples - Adjust to your cluster capacity!)
+# These are common configurations passed via spark-submit or SparkSession builder
+spark_config:
+  # Driver Configuration
+  spark.driver.memory: "1g"          # Mémoire pour le processus driver Spark
+  spark.driver.cores: 1              # Nombre de coeurs pour le driver (souvent 1)
+
+  # Executor Configuration
+  spark.executor.memory: "2g"        # Mémoire par processus executor
+  spark.executor.cores: 2            # Nombre de coeurs par executor
+  # spark.executor.instances: 2      # Nombre d'executors à démarrer (souvent défini au lancement)
+
+  # Other Common Configurations
+  spark.sql.shuffle.partitions: "50" # Nombre de partitions pour les shuffles (ajuster selon la taille des données)
+  # spark.serializer: "org.apache.spark.serializer.KryoSerializer" # Peut améliorer les performances de sérialisation
+  # spark.sql.files.maxPartitionBytes: "134217728" # 128 MB - Contrôle taille partitions lues depuis fichiers
+
+# Configurations specific to JDBC interactions (optional, adjust driver/version)
+# spark.jars.packages: "org.mariadb.jdbc:mariadb-java-client:3.0.8"
+
+# Note: Some configurations (like executor.instances, master URL) are often
+# better specified at submission time via spark-submit arguments rather than hardcoded here.
+# This file provides reasonable defaults that can be overridden.

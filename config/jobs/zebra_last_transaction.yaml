@@ -1,0 +1,57 @@
+# Configuration for the Zebra Last Transaction Job
+
+# --- Database Configuration ---
+# Reference to the connection defined in config/common/db_connections.ini
+# The loader module will use this name to look up the actual connection details.
+database_connection_name: "DM_v1"  # Ou "DM_v2" selon l'environnement cible
+
+# Source Table Names (remain specific to this job)
+tables:
+  users: "DWH.zebra_rp2p_master"
+  transactions: "DWH.zebra_rp2p_transaction"
+
+# Source Column Names (Mapping)
+columns:
+  users:
+    msisdn: "user_msisdn"
+    status: "user_status"
+    category: "user_category_name"
+  transactions:
+    sndr_msisdn: "tra_sndr_msisdn"
+    rcvr_msisdn: "tra_receiver_msisdn"
+    date: "tra_date"
+    sndr_category: "tra_sndr_category"
+    rcvr_category: "tra_receiver_category"
+    channel: "tra_channel"
+    # date_format: "yyyy-MM-dd HH:mm:ss" # Specify if not standard Spark format
+
+# Business Logic Constants
+business_logic:
+  active_status_value: "ACTIF"
+  channel_c2s: "C2S"
+  channel_o2c: "O2C"
+  channel_c2c: "C2C"
+
+# --- Output Configuration ---
+output:
+  path: "/path/on/hdfs_or_s3/to/zebra_last_transaction_output"
+  format: "parquet"
+  partition_by: "day"
+  mode: "overwrite"
+
+# --- Metadata Tracking ---
+metadata:
+  # Reference to the connection for metadata if stored in a DB
+  # metadata_db_connection_name: "DM_v1" # Example if metadata is in the same DB
+  # tracker_db_table: "metadata_db.job_tracker" # Example table name
+  # OR File based:
+  tracker_file_path: "/path/on/hdfs_or_local/to/zebra_last_transaction_metadata.json"
+  job_name_identifier: "zebra_last_transaction"
+
+# These settings will override or add to those in config/common/spark_defaults.yaml
+spark_config:
+  spark.driver.memory: "2g"          # Override default common driver memory
+  spark.executor.memory: "4g"        # Override default common executor memory
+  spark.executor.cores: 4            # Override default common executor cores
+  spark.sql.shuffle.partitions: "100" # Override default shuffle partitions for this specific job
+  # my.custom.spark.setting: "value_for_zebra_job" # Add a new setting specific to this job

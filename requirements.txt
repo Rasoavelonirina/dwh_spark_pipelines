@@ -1,0 +1,3 @@
+# Base Spark and YAML processing
+pyspark>=3.0.0  # Ajustez la version si nécessaire
+PyYAML>=5.0     # Pour lire les fichiers config .yaml
