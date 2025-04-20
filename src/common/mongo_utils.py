@@ -12,8 +12,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Liste (non exhaustive) d'options de connexion Mongo NON overrideables par les jobs
+MONGO_CORE_CONNECTION_KEYS = {'uri', 'host', 'port', 'base', 'user', 'pwd', 'authSource', 'replicaSet', 'db_type', 'mongo_options'}
+# Options du connecteur Spark connues (pour référence)
+# Voir: https://www.mongodb.com/docs/spark-connector/current/configuration/
+
 # --- Fonction Helper pour extraire les options Mongo ---
-def get_mongo_connection_options(config: dict, connection_name: str) -> dict:
+def get_mongo_connection_options(config: dict, connection_name: str, overrides: dict = None) -> dict:
     """
     Extracts MongoDB connection options for a given connection name from the configuration.
 
@@ -28,6 +33,12 @@ def get_mongo_connection_options(config: dict, connection_name: str) -> dict:
     Raises:
         ValueError: If required configuration keys are missing.
     """
+
+    if not connection_name:
+        raise ValueError("MongoDB connection name cannot be empty.")
+    if overrides is None:
+        overrides = {}
+
     # ... (Get db_connections and conn_details as before) ...
     db_connections = config.get('db_connections')
     if not db_connections or connection_name not in db_connections:
@@ -102,6 +113,23 @@ def get_mongo_connection_options(config: dict, connection_name: str) -> dict:
         # Ajouter d'autres options de base si nécessaire ici, ex:
         # "readPreference.name": conn_details.get('readPreference'), # Exemple
     }
+
+    # Appliquer les overrides (provenant du YAML job)
+    # Ces overrides doivent utiliser les noms d'options du connecteur Spark
+    applied_overrides = {}
+    if overrides and isinstance(overrides, dict):
+        for key, value in overrides.items():
+             # Sécurité: Vérifier si on tente d'écraser une clé de base (moins pertinent ici car URI est roi)
+            if key.lower() in MONGO_CORE_CONNECTION_KEYS:
+                 logger.warning(f"Attempted to override core connection key '{key}' via overrides for '{connection_name}'. Override ignored.")
+            else:
+                 # Ajouter/Écraser les options comportementales pour le connecteur Spark
+                 options_for_spark[key] = value
+                 applied_overrides[key] = value
+        if applied_overrides:
+             logger.info(f"Applied connection option overrides for '{connection_name}': {applied_overrides}")
+        else:
+             logger.debug(f"No applicable options overrides found for '{connection_name}'.")
 
     return options_for_spark
 
