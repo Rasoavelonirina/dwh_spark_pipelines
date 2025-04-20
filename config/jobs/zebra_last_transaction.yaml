@@ -1,57 +1,81 @@
-# Configuration for the Zebra Last Transaction Job
+# config/jobs/zebra_last_transaction.yaml
+# =======================================
+# Configuration for the Zebra Last Transaction Job (Updated Structure)
 
-# --- Database Configuration ---
-# Reference to the connection defined in config/common/db_connections.ini
-# The loader module will use this name to look up the actual connection details.
-database_connection_name: "DM_v1"  # Ou "DM_v2" selon l'environnement cible
+# --- Job Specific Application Name ---
+spark_app_name: "ZebraLastTransaction"
 
-# Source Table Names (remain specific to this job)
-tables:
-  users: "DWH.zebra_rp2p_master"
-  transactions: "DWH.zebra_rp2p_transaction"
+# --- Data Source Connections ---
+# Define logical names for the sources needed by this job.
+data_sources:
 
-# Source Column Names (Mapping)
+  # Source for User Master Data (Active Status)
+  zebra_users:                   # Logical name for this source
+    connection_name: "DM_v1"     # Physical connection from db_connections.ini
+    db_type: "mariadb"           # Optional for clarity, MUST match .ini if present
+    table: "DWH.zebra_rp2p_master" # Specific table for user data
+    # Optional: Overrides for reading user data (if needed)
+    # options_override:
+    #   fetchsize: "5000"
+
+  # Source for Transaction Data
+  zebra_transactions:            # Logical name for this source
+    connection_name: "DM_v1"     # Same physical connection as users
+    db_type: "mariadb"           # Optional for clarity
+    table: "DWH.zebra_rp2p_transaction" # Specific table for transaction data
+    # Optional: Overrides for reading transaction data (if needed)
+    # options_override:
+    #   fetchsize: "20000" # Potentially larger fetchsize for transactions
+    #   queryTimeout: "600"
+
+# --- Column Mappings (Recommended) ---
+# Map logical concepts to physical columns within each source
 columns:
-  users:
+  # Columns from the 'zebra_users' logical source
+  zebra_users:
     msisdn: "user_msisdn"
     status: "user_status"
     category: "user_category_name"
-  transactions:
+  # Columns from the 'zebra_transactions' logical source
+  zebra_transactions:
     sndr_msisdn: "tra_sndr_msisdn"
     rcvr_msisdn: "tra_receiver_msisdn"
     date: "tra_date"
     sndr_category: "tra_sndr_category"
     rcvr_category: "tra_receiver_category"
     channel: "tra_channel"
-    # date_format: "yyyy-MM-dd HH:mm:ss" # Specify if not standard Spark format
 
-# Business Logic Constants
+# --- Business Logic Constants ---
 business_logic:
   active_status_value: "ACTIF"
   channel_c2s: "C2S"
   channel_o2c: "O2C"
   channel_c2c: "C2C"
 
-# --- Output Configuration ---
-output:
-  path: "/path/on/hdfs_or_s3/to/zebra_last_transaction_output"
-  format: "parquet"
-  partition_by: "day"
-  mode: "overwrite"
+# --- Output Destinations ---
+# Define the output(s) for this job.
+outputs:
+  # Primary output destination for the results
+  last_transaction_output:        # Logical name for the output
+    output_type: "parquet_file"   # Type of output (used by writer logic)
+    # connection_name: "hdfs_prod" # Optional: If managing filesystem connections formally
+    path: "/data/processed/zebra_last_transaction" # <<< IMPORTANT: Set your actual output path (HDFS/S3/Local)
+    partition_by: ["day"]         # List of columns for partitioning
+    mode: "overwrite"             # Spark write mode for partitions
+    # Optional: Override specific Parquet write options
+    options_override:
+      compression: "snappy"
 
 # --- Metadata Tracking ---
 metadata:
-  # Reference to the connection for metadata if stored in a DB
-  # metadata_db_connection_name: "DM_v1" # Example if metadata is in the same DB
-  # tracker_db_table: "metadata_db.job_tracker" # Example table name
-  # OR File based:
-  tracker_file_path: "/path/on/hdfs_or_local/to/zebra_last_transaction_metadata.json"
-  job_name_identifier: "zebra_last_transaction"
+  # --- Choose ONE method: File or Database ---
+  tracker_file_path: "/data/metadata/jobs/zebra_last_transaction/tracker.json" # <<< IMPORTANT: Set your actual metadata file path
+  # metadata_db_connection_name: "DM_v1"
+  # tracker_db_table: "technical_db.job_metadata"
 
-# These settings will override or add to those in config/common/spark_defaults.yaml
-spark_config:
-  spark.driver.memory: "2g"          # Override default common driver memory
-  spark.executor.memory: "4g"        # Override default common executor memory
-  spark.executor.cores: 4            # Override default common executor cores
-  spark.sql.shuffle.partitions: "100" # Override default shuffle partitions for this specific job
-  # my.custom.spark.setting: "value_for_zebra_job" # Add a new setting specific to this job
+  # --- Unique identifier for this job ---
+  job_name_identifier: "zebra_last_transaction" # <<< MUST be unique across all jobs using the same metadata store
+
+# --- Spark Config Overrides (Optional) ---
+# spark_config:
+#   spark.executor.memory: "4g"
