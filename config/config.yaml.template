@@ -1,0 +1,136 @@
+# config/config.yaml.template
+# ============================
+# Template for Job Configuration Files
+
+# --- General Job Information ---
+# Optional: Specific name for the Spark application run of this job.
+# spark_app_name: "MySparkJobName"
+
+# --- Data Source Connections ---
+# Define all data sources required by this job.
+# Each key is a logical name used within the job's code (loader, etc.).
+data_sources:
+
+  # --- Example: JDBC Source (e.g., MariaDB, PostgreSQL) ---
+  logical_source_name_jdbc:              # <<< CHOOSE a meaningful logical name (e.g., users_db, raw_events_db)
+    connection_name: "physical_conn_name_jdbc" # <<< MUST match a section in common/db_connections.ini
+    db_type: "mariadb" # Optional if defined in .ini, but good for clarity here. MUST match .ini if present.
+    table: "schema_name.table_name"      # <<< SPECIFY the exact table for this source
+    # Optional: Override specific JDBC BEHAVIORAL options for this source usage.
+    # Does NOT override host, user, pwd, base, driver defined in .ini.
+    options_override:
+      fetchsize: "10000"                 # Example: Spark JDBC fetch size
+      # queryTimeout: "600"              # Example: Query timeout in seconds
+      # sessionInitStatement: "SET time_zone='+00:00';" # Example: Execute statement on connection init
+
+  # --- Example: MongoDB Source ---
+  logical_source_name_mongo:             # <<< CHOOSE a meaningful logical name (e.g., transactions_mongo, product_catalog)
+    connection_name: "physical_conn_name_mongo" # <<< MUST match a section in common/db_connections.ini
+    db_type: "mongodb" # Optional if defined in .ini, but good for clarity here. MUST match .ini if present.
+    collection: "my_collection_name"     # <<< SPECIFY the exact collection for this source
+    # Optional: Override specific MongoDB BEHAVIORAL options for this source usage.
+    # Uses Spark connector option names. Does NOT override URI components (host, db, auth...).
+    options_override:
+      # readPreference.name: "secondary" # Example: Override default read preference
+      # readConcern.level: "local"     # Example: Override default read concern
+      # maxPoolSize: "100"             # Example: Specific connection pool setting
+      # schema: "STRUCT<field1:STRING, field2:INT>" # Example: Provide schema for reading
+
+  # --- Example: SFTP Source ---
+  logical_source_name_sftp:              # <<< CHOOSE a meaningful logical name (e.g., partner_files_sftp, daily_feed_sftp)
+    connection_name: "physical_conn_name_sftp" # <<< MUST match a section in common/remote_access.ini
+    # Note: db_type might not be relevant or could be 'sftp'
+    # The specific remote path will likely be passed in the job's code (loader), not defined here.
+    # Or you could add a 'base_path' field here if useful.
+    # Optional: Override specific SFTP connection options (Timeout, Ciphers, etc.)
+    # Requires support in SftpHandler and get_sftp_connection_details
+    # options_override:
+      # timeout: 30 # Example: Connection timeout
+      # ciphers: ['aes256-ctr', 'aes192-ctr'] # Example: Specify allowed ciphers
+
+  # --- Example: Local File System Source ---
+  # Could be handled similarly if needed, pointing to a base path maybe
+  # logical_source_name_local:
+  #   connection_name: "local_fs_config" # Maybe define base paths in a specific common config?
+  #   base_path: "/data/landing_zone/specific_feed/" # Job code would append filename/pattern
+
+  # --- Add more data sources as needed ---
+  # another_logical_source:
+  #   connection_name: ...
+  #   table: ... / collection: ...
+
+# --- Column Mappings (Optional, but Recommended) ---
+# Map logical concepts to physical columns for clarity and flexibility.
+# Structure mirrors the `data_sources` section using logical names.
+# columns:
+#   logical_source_name_jdbc:
+#     logical_user_id: "physical_column_userId"
+#     logical_timestamp: "event_time"
+#   logical_source_name_mongo:
+#     logical_product_id: "productId"
+#     logical_description: "desc"
+
+# --- Business Logic Constants ---
+# Define values used in the job's transformation logic.
+business_logic:
+  some_threshold: 100.0
+  target_category: "PROCESSED"
+  # ... other constants ...
+
+# --- Output Destinations ---
+# Define all outputs for this job.
+# Structure mirrors `data_sources`.
+outputs:
+
+  # --- Example: JDBC Output ---
+  primary_jdbc_output:                 # <<< CHOOSE a meaningful logical name for the output
+    connection_name: "physical_conn_name_jdbc_out" # <<< MUST match a section in common/db_connections.ini
+    db_type: "mariadb" # Optional for clarity
+    table: "schema_name.output_table"    # <<< SPECIFY the exact output table
+    mode: "overwrite"                    # <<< Spark write mode ('overwrite', 'append', etc.)
+    # Optional: Override specific JDBC write options.
+    options_override:
+      batchsize: "10000"
+      # truncate: "true" # Be very careful with truncate!
+      # isolationLevel: "READ_UNCOMMITTED" # Example
+
+  # --- Example: Parquet Output to HDFS/S3 (Requires a handler or direct write) ---
+  # For file outputs, connection_name might point to a config defining the filesystem (e.g., HDFS Namenode)
+  # Or it might be handled differently (directly using paths). Let's assume a direct path for now.
+  parquet_output_hdfs:                 # <<< CHOOSE a meaningful logical name
+    # connection_name: "hdfs_cluster_1" # Example if managing FS connections
+    output_type: "parquet_file"        # Indicate file type
+    path: "/data/processed/my_job_output" # <<< SPECIFY the base output path
+    partition_by: ["year", "month", "day"] # <<< List of columns to partition by (optional)
+    mode: "overwrite"                    # <<< Spark write mode
+    # Optional: Override specific Parquet write options
+    options_override:
+      compression: "snappy"             # e.g., snappy, gzip
+      # maxRecordsPerFile: 1000000      # Example Spark option
+
+  # --- Example: Output to SFTP (Requires SftpHandler usage in writer) ---
+  # report_file_sftp:
+  #   connection_name: "partner_report_sftp" # <<< MUST match a section in common/remote_access.ini
+  #   output_type: "sftp_file"
+  #   remote_base_path: "/uploads/reports/" # Job code would construct filename
+    # options_override: ... # Options for SftpHandler.put if any
+
+  # --- Add more outputs as needed ---
+
+# --- Metadata Tracking ---
+# Configuration for tracking the last processed date.
+metadata:
+  # --- Choose ONE method: File or Database ---
+  # tracker_file_path: "/path/to/metadata/tracker_{job_name}.json" # Use placeholders if desired
+  # metadata_db_connection_name: "MetadataDB"
+  # tracker_db_table: "common_jobs.metadata_log"
+
+  # --- Unique identifier for this job in the metadata store ---
+  job_name_identifier: "unique_job_identifier" # <<< SET a unique ID for this job
+
+# --- Spark Config Overrides (Optional) ---
+# Override common Spark settings if this job has specific needs.
+# spark_config:
+#   spark.executor.memory: "8g"
+#   spark.executor.cores: 4
+#   spark.sql.adaptive.enabled: "true"
