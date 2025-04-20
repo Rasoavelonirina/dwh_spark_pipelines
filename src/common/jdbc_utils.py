@@ -13,14 +13,20 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Liste des clés de connexion fondamentales NON overrideables par les options du job
+JDBC_CORE_CONNECTION_KEYS = {'uri', 'host', 'port', 'base', 'user', 'pwd', 'driver', 'db_type', 'jdbc_options_str'}
+# Liste des options JDBC Spark connues (non exhaustive, pour référence)
+# Voir: https://spark.apache.org/docs/latest/sql-data-sources-jdbc.html
+
 # --- Fonction Helper (Déplacée et Généralisée depuis loader.py) ---
-def get_db_connection_properties(config: dict, connection_name: str) -> tuple[str, dict]:
+def get_db_connection_properties(config: dict, connection_name: str, overrides: dict = None ) -> tuple[str, dict]:
     """
     Extracts database connection details for a given connection name from the configuration.
 
     Args:
         config (dict): The application configuration dictionary.
         connection_name (str): The name of the connection section in 'db_connections'.
+        overrides (dict, optional): Additional connection properties to override or add.
 
     Returns:
         tuple: (jdbc_url, connection_properties) where connection_properties is a dict
@@ -29,6 +35,12 @@ def get_db_connection_properties(config: dict, connection_name: str) -> tuple[st
     Raises:
         ValueError: If required configuration keys are missing.
     """
+    # Validate input parameters
+    if not connection_name:
+        raise ValueError("Database connection name cannot be empty.")
+    if overrides is None:
+        overrides = {}
+    
     # ... (Get db_connections and conn_details as before) ...
     db_connections = config.get('db_connections')
     if not db_connections or connection_name not in db_connections:
@@ -42,7 +54,9 @@ def get_db_connection_properties(config: dict, connection_name: str) -> tuple[st
     base = conn_details.get('base')
     user = conn_details.get('user')
     password = conn_details.get('pwd')
-    jdbc_options = conn_details.get('jdbc_options', '') # Options supplémentaires
+    driver_from_ini = conn_details.get('driver')
+    jdbc_options_str = conn_details.get('jdbc_options', '') # Options de base depuis .ini
+    custom_props_from_ini = conn_details.get('properties', {}) # Props additionnels depuis .ini
 
     # --- Validation des composants requis ---
     if not host: raise ValueError(f"Missing 'host' for JDBC connection '{connection_name}'.")
@@ -59,7 +73,7 @@ def get_db_connection_properties(config: dict, connection_name: str) -> tuple[st
         'sqlserver': 'com.microsoft.sqlserver.jdbc.SQLServerDriver'
     }
     port = port_str if port_str else default_ports.get(db_type.lower())
-    driver = conn_details.get('driver', default_drivers.get(db_type.lower()))
+    driver = driver_from_ini if driver_from_ini else default_drivers.get(db_type.lower())
 
     if not port: logger.warning(f"Could not determine default port for db_type '{db_type}'. Specify 'port' in config.")
     # Port might still be None if db_type unknown and port not specified
@@ -70,11 +84,12 @@ def get_db_connection_properties(config: dict, connection_name: str) -> tuple[st
     # --- Construire l'URL JDBC ---
     # Format: jdbc:<db_type>://<host>:<port>/<base>?<options>
     jdbc_url = f"jdbc:{db_type}://{host}{port_str_for_url}/{base}"
-    if jdbc_options:
+    if jdbc_options_str:
         # Assurer que les options commencent par '?'
-        if not jdbc_options.startswith('?'):
-             jdbc_options = '?' + jdbc_options
-        jdbc_url += jdbc_options
+        jdbc_options_str = jdbc_options_str.strip()
+        if not jdbc_options_str.startswith('?'):
+             jdbc_options_str = '?' + jdbc_options_str
+        if len(jdbc_options_str) > 1: jdbc_url += jdbc_options_str # Ajouter seulement si options existent
     logger.debug(f"Constructed JDBC URL for '{connection_name}': {jdbc_url}")
 
     # --- Préparer les propriétés ---
@@ -83,10 +98,27 @@ def get_db_connection_properties(config: dict, connection_name: str) -> tuple[st
         "password": password,
         "driver": driver
     }
-    custom_props = conn_details.get('properties') # Garder la possibilité de props additionnels
-    if custom_props and isinstance(custom_props, dict):
-        properties.update(custom_props)
-        logger.debug(f"Added custom JDBC properties for '{connection_name}': {custom_props}")
+    
+    # 1. Ajouter les 'properties' de l'INI (si présents)
+    if custom_props_from_ini and isinstance(custom_props_from_ini, dict):
+        properties.update(custom_props_from_ini)
+        logger.debug(f"Added base properties from ini for '{connection_name}': {custom_props_from_ini}")
+
+    # 2. Appliquer les overrides (provenant du YAML job)
+    applied_overrides = {}
+    if overrides and isinstance(overrides, dict):
+        for key, value in overrides.items():
+            # Sécurité: Ne pas autoriser l'override des clés de connexion fondamentales
+            if key.lower() in JDBC_CORE_CONNECTION_KEYS:
+                logger.warning(f"Attempted to override core connection key '{key}' for '{connection_name}'. Override ignored.")
+            else:
+                # Autoriser l'override des options comportementales
+                properties[key] = value
+                applied_overrides[key] = value
+        if applied_overrides:
+             logger.info(f"Applied connection option overrides for '{connection_name}': {applied_overrides}")
+        else:
+             logger.debug(f"No applicable options overrides found for '{connection_name}'.")
 
     return jdbc_url, properties
 
