@@ -41,6 +41,13 @@ data_pipelines_project/
 │   │   └── zebra_last_transaction.yaml
 │   │   └── ... (autres jobs)
 │   └── config.yaml.template    # Modèle pour la config des jobs
+├── docs/                        # NOUVEAU: Dossier pour la documentation
+│   ├── jobs/                    # Documentation spécifique aux jobs
+│   │   ├── zebra_last_transaction.md # README pour ce job
+│   │   └── customer_segmentation.md  # README pour un autre job
+│   │   └── ...
+│   ├── architecture.md          # (Optionnel) Diagrammes d'architecture globale
+│   └── common_modules.md        # (Optionnel) Doc détaillée des modules communs
 │
 ├── src/                        # Code source Python
 │   ├── common/                 # Modules utilitaires partagés
