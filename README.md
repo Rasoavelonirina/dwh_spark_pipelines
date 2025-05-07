@@ -200,7 +200,7 @@ Le script `scripts/run_spark_job.sh` est le point d'entrée recommandé pour lan
 ## 5. Jobs Implémentés
 
 ### 5.1 zebra_last_transaction
-
+*   [Voir la documentation détaillée](docs/jobs/zebra_last_transaction.md)
 *   **Objectif :** Déterminer, pour chaque client ZEBRA actif, la date de sa dernière transaction (C2S, O2C, C2C) et sa catégorie associée.
 *   **Configuration :** `config/jobs/zebra_last_transaction.yaml`
 *   **Sources Logiques :** `zebra_users` (MariaDB), `zebra_transactions` (MariaDB).
