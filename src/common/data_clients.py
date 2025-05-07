@@ -2,7 +2,9 @@
 import logging, os
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import StructType
-import stat 
+import stat
+import shutil
+import uuid
 # Import helpers and handlers from other common modules
 try:
     from common.base_data_handler import BaseDataHandler
@@ -401,7 +403,6 @@ def read_data(spark: SparkSession, config: dict, logical_source_name: str, **kwa
         finally:
             # Nettoyer les fichiers temporaires (optionnel, peut être utile pour debug)
             if downloaded_files_paths and run_temp_dir and os.path.exists(run_temp_dir):
-                 import shutil
                  try:
                       logger.debug(f"Cleaning up temporary SFTP download directory: {run_temp_dir}")
                       shutil.rmtree(run_temp_dir)
@@ -411,3 +412,227 @@ def read_data(spark: SparkSession, config: dict, logical_source_name: str, **kwa
     # --- Type de Source Inconnu ---
     else:
         raise NotImplementedError(f"Reading from source_type '{source_type}' is not implemented yet for logical source '{logical_source_name}'.")
+
+# --- NOUVELLE Fonction write_data ---
+def write_data(df: DataFrame, spark: SparkSession, config: dict, logical_output_name: str, **kwargs):
+    """
+    Writes a DataFrame to a configured logical output destination.
+    Supports various types (JDBC, Mongo, Parquet, CSV, SFTP...) and options.
+
+    Args:
+        df (DataFrame): The Spark DataFrame to write.
+        spark (SparkSession): The active SparkSession.
+        config (dict): The application configuration dictionary.
+        logical_output_name (str): The logical name of the output destination defined
+                                   in the job's YAML file under 'outputs'.
+        **kwargs: Optional keyword arguments to override configuration or pass specific
+                  write options not suitable for YAML (rare for writes).
+                  Example: write_mode='append' (overrides YAML mode).
+
+    Raises:
+        ValueError: If configuration is missing or invalid for the output type.
+        TypeError: If the handler type doesn't match the requested operation.
+        NotImplementedError: If a requested output type or operation is not yet supported.
+        Exception: Any underlying Spark or I/O exception during write.
+    """
+    logger.info(f"Attempting to write data for logical output: '{logical_output_name}'")
+
+    if df is None or df.rdd.isEmpty():
+        logger.warning(f"Input DataFrame for output '{logical_output_name}' is None or empty. Nothing to write.")
+        return # Exit gracefully if nothing to write
+
+    # --- 1. Get Logical Output Configuration ---
+    output_configs = config.get("outputs")
+    if not output_configs or logical_output_name not in output_configs:
+        raise ValueError(f"Configuration for logical output '{logical_output_name}' not found in 'outputs' section.")
+    output_config = output_configs[logical_output_name]
+
+    # --- 2. Determine Output Type ---
+    output_type = output_config.get('output_type')
+    if not output_type:
+        # Essayer de deviner basé sur la présence de clés (moins fiable pour output)
+        if output_config.get('table') and output_config.get('connection_name'): output_type = 'jdbc_table'
+        elif output_config.get('collection') and output_config.get('connection_name'): output_type = 'mongo_collection'
+        elif output_config.get('path') and not output_config.get('connection_name'): output_type = 'parquet_file' # Default to parquet
+        elif output_config.get('connection_name') and 'sftp' in output_config.get('connection_name','').lower(): output_type = 'sftp_file'
+        else: raise ValueError(f"Cannot determine 'output_type' for '{logical_output_name}'. Specify explicitly.")
+    output_type = output_type.lower()
+    logger.info(f"Determined output type as: '{output_type}' for logical output '{logical_output_name}'.")
+
+    # --- 3. Prepare Base Write Options and Mode ---
+    base_options = output_config.get('options_override', {})
+    final_write_options = {**base_options, **kwargs} # kwargs peuvent override options_override
+    # Mode d'écriture: priorité kwargs > YAML > défaut 'overwrite'
+    write_mode = final_write_options.pop('mode', output_config.get('mode', 'overwrite'))
+    if write_mode not in ["append", "overwrite", "ignore", "error", "errorifexists"]:
+        logger.warning(f"Invalid write mode '{write_mode}' provided. Defaulting to 'overwrite'.")
+        write_mode = 'overwrite'
+    logger.info(f"Using write mode: '{write_mode}'")
+    logger.debug(f"Base write options (after override merge): {final_write_options}")
+
+
+    # --- 4. Dispatch Write Operation based on Output Type ---
+
+    # --- JDBC ---
+    if output_type in ['jdbc_table', 'mariadb_table', 'mysql_table', 'postgres_table']:
+        target_table = output_config.get('table')
+        if not target_table: raise ValueError(f"Missing 'table' for JDBC output '{logical_output_name}'.")
+
+        handler = get_data_handler(spark, config, logical_output_name, source_type='outputs')
+        if not handler or not isinstance(handler, JdbcHandler):
+            raise TypeError(f"Could not get valid JdbcHandler for output '{logical_output_name}'.")
+
+        logger.info(f"Performing JDBC table write to '{target_table}'.")
+        try:
+            # Passer les options fusionnées à la méthode write du handler
+            handler.write(df, target=target_table, mode=write_mode, options=final_write_options)
+        except Exception as e:
+             # L'erreur est déjà loguée dans le handler, on la propage
+             raise e
+
+    # --- MongoDB ---
+    elif output_type == 'mongo_collection':
+        target_collection = output_config.get('collection')
+        if not target_collection: raise ValueError(f"Missing 'collection' for MongoDB output '{logical_output_name}'.")
+
+        handler = get_data_handler(spark, config, logical_output_name, source_type='outputs')
+        if not handler or not isinstance(handler, MongoHandler):
+            raise TypeError(f"Could not get valid MongoHandler for output '{logical_output_name}'.")
+
+        logger.info(f"Performing MongoDB collection write to '{target_collection}'.")
+        try:
+            # Passer les options fusionnées à la méthode write du handler
+            handler.write(df, target=target_collection, mode=write_mode, options=final_write_options)
+        except Exception as e:
+             raise e
+
+    # --- File Systems (Parquet, CSV, JSON...) ---
+    elif output_type in ['parquet_file', 'csv_file', 'json_file', 'orc_file', 'text_file']:
+        file_format = output_type.split('_')[0] # parquet, csv, json, orc, text
+        path = output_config.get('path')
+        partition_columns = output_config.get('partition_by') # Doit être une liste
+
+        if not path: raise ValueError(f"Missing 'path' for file output '{logical_output_name}'.")
+
+        logger.info(f"Writing {file_format} file(s) to path: {path}")
+        if partition_columns: logger.info(f"Partitioning by: {partition_columns}")
+
+        # Pop options connues pour les appliquer spécifiquement
+        header = final_write_options.pop('header', None)
+        sep = final_write_options.pop('sep', None)
+        encoding = final_write_options.pop('encoding', None)
+        compression = final_write_options.pop('compression', None)
+        # Ajouter d'autres options de fichier si besoin
+
+        try:
+            writer = df.write.format(file_format).mode(write_mode)
+            if partition_columns and isinstance(partition_columns, list) and partition_columns:
+                writer = writer.partitionBy(*partition_columns)
+
+            # Appliquer options connues
+            if header is not None and file_format == 'csv': writer = writer.option("header", str(header).lower())
+            if sep is not None and file_format == 'csv': writer = writer.option("sep", sep)
+            if encoding is not None: writer = writer.option("encoding", encoding)
+            if compression is not None: writer = writer.option("compression", compression)
+
+            # Appliquer les options restantes (override ou spécifiques au format)
+            writer = writer.options(**final_write_options)
+
+            writer.save(path)
+            logger.info(f"Successfully wrote {file_format} data to: {path}")
+
+        except Exception as e:
+             logger.error(f"Failed to write {file_format} data to {path}: {e}", exc_info=True)
+             raise
+
+    # --- SFTP File ---
+    elif output_type in ['sftp_file', 'sftp_csv', 'sftp_parquet']: # Être spécifique
+        file_format_to_write = output_type.split('_')[-1] # csv, parquet, etc.
+        if file_format_to_write == 'file': file_format_to_write = 'text' # Ou gérer binaire?
+
+        remote_base_path = output_config.get('remote_base_path') # Où uploader sur le serveur SFTP
+        # Nom de fichier pourrait être dynamique (basé sur date, etc.) passé en kwargs?
+        output_filename_pattern = final_write_options.pop('output_filename_pattern', f"{logical_output_name}_output") # Ex: "report_{date}.csv"
+        local_temp_dir = final_write_options.pop('local_temp_dir', "/tmp/spark_sftp_uploads")
+
+        if not remote_base_path: raise ValueError(f"Missing 'remote_base_path' for SFTP output '{logical_output_name}'.")
+        if not SftpHandler: raise ImportError("SftpHandler not available.")
+
+        sftp_handler = get_sftp_handler(config, logical_output_name, source_type='outputs')
+        if not sftp_handler:
+             raise RuntimeError(f"Failed to get SftpHandler for output '{logical_output_name}'.")
+
+        # --- Écrire d'abord dans un répertoire temporaire LOCAL ---
+        # Créer un nom de fichier/dossier temporaire unique localement
+        run_temp_dir = os.path.join(local_temp_dir, f"{logical_output_name}_{uuid.uuid4()}")
+        local_write_path = os.path.join(run_temp_dir, "data") # Écrire dans un sous-dossier "data"
+
+        logger.info(f"Writing intermediate '{file_format_to_write}' files to local temp path: {local_write_path}")
+        # --- Utiliser la logique d'écriture fichier standard pour écrire localement ---
+        try:
+            # Repartitionner AVANT l'écriture locale pour contrôler le nombre de fichiers à uploader ?
+            # df_to_write_local = df.repartition(1) # Écrire 1 fichier (peut être gros)
+            df_to_write_local = df # Ou garder le partitionnement existant
+
+            # Extraire les options spécifiques au format pour l'écriture locale
+            local_write_options = final_write_options.copy() # Travailler sur une copie
+            header = local_write_options.pop('header', None)
+            sep = local_write_options.pop('sep', None)
+            encoding = local_write_options.pop('encoding', None)
+            compression = local_write_options.pop('compression', None) # Important pour Parquet/ORC
+
+            local_writer = df_to_write_local.write.format(file_format_to_write).mode("overwrite") # Toujours overwrite dans temp
+            if header is not None and file_format_to_write == 'csv': local_writer = local_writer.option("header", str(header).lower())
+            if sep is not None and file_format_to_write == 'csv': local_writer = local_writer.option("sep", sep)
+            if encoding is not None: local_writer = local_writer.option("encoding", encoding)
+            if compression is not None: local_writer = local_writer.option("compression", compression)
+            local_writer = local_writer.options(**local_write_options)
+
+            local_writer.save(local_write_path)
+            logger.info(f"Successfully wrote intermediate files to: {local_write_path}")
+
+        except Exception as e:
+             logger.error(f"Failed to write intermediate files to {local_write_path} for SFTP upload: {e}", exc_info=True)
+             # Nettoyer si possible avant de lever l'erreur
+             if os.path.exists(run_temp_dir): shutil.rmtree(run_temp_dir, ignore_errors=True)
+             raise e
+
+        # --- Uploader les fichiers écrits depuis le temp local vers SFTP ---
+        files_uploaded_count = 0
+        try:
+            with sftp_handler as sftp:
+                logger.info(f"Uploading files from {local_write_path} to SFTP remote path '{remote_base_path}'")
+                sftp.make_dir(remote_base_path) # Assurer que le répertoire distant existe
+
+                # Lister les fichiers réellement écrits par Spark (part-*)
+                for filename in os.listdir(local_write_path):
+                    if filename.startswith("part-") and not filename.endswith(".crc"): # Ignorer fichiers crc
+                         local_file_path = os.path.join(local_write_path, filename)
+                         # Construire nom de fichier distant (ex: renommer part-* en qqch de plus propre)
+                         # Ici, on utilise un pattern simple. Pourrait être plus complexe (inclure date, etc.)
+                         remote_filename = f"{output_filename_pattern}{filename.replace('part-', '_part_')}" # Ex: my_output_part_00000.parquet
+                         remote_final_path = os.path.join(remote_base_path, remote_filename) # Utiliser os.path.join
+
+                         logger.debug(f"Uploading '{local_file_path}' to '{remote_final_path}'")
+                         sftp.upload_file(local_file_path, remote_final_path)
+                         files_uploaded_count += 1
+
+            logger.info(f"Successfully uploaded {files_uploaded_count} file(s) to SFTP remote path: {remote_base_path}")
+
+        except Exception as e:
+             logger.error(f"Failed during SFTP upload for '{logical_output_name}': {e}", exc_info=True)
+             raise # Lever l'erreur si l'upload échoue
+        finally:
+             # Nettoyer le répertoire temporaire local
+             if os.path.exists(run_temp_dir):
+                  try:
+                       logger.debug(f"Cleaning up temporary SFTP upload directory: {run_temp_dir}")
+                       shutil.rmtree(run_temp_dir)
+                  except Exception as cleanup_e:
+                       logger.warning(f"Could not cleanup temporary directory {run_temp_dir}: {cleanup_e}")
+
+    # --- Type de Sortie Inconnu ---
+    else:
+        raise NotImplementedError(f"Writing to output_type '{output_type}' is not implemented yet.")
+
+    logger.info(f"--- Data Writing Finished for output '{logical_output_name}' ---")
